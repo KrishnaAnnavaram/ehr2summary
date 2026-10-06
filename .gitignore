@@ -1,0 +1,28 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# data, runs and model outputs are never committed (MIMIC data needs a data use agreement)
+/data/*
+!/data/README.md
+/runs/
+/reports/
+/models/
+/artifacts/
+*.db
+*.sqlite
+*.csv
+*.csv.gz
+*.jsonl
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
