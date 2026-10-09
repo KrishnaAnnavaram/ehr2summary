@@ -74,6 +74,7 @@ This README is the **one location that explains all of ehr2summary**. It gives t
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one admission](#42-the-life-cycle-of-one-admission)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [The record builder](#5-the-record-builder)
 6. 🟢 [The generators](#6-the-generators)
 7. 🟣 [The faithfulness check and the judges](#7-the-faithfulness-check-and-the-judges)
@@ -138,6 +139,53 @@ flowchart LR
 | Synthetic data | `src/ehr2summary/synthetic.py` | Invented admissions in the MIMIC-III table layout |
 | CLI | `src/ehr2summary/cli.py` | The `ehr2summary` command |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>ehr2summary command"]
+    CFG["config.py<br/>Settings, ModelSettings"]
+    SYN["synthetic.py<br/>write_synthetic"]
+    subgraph DATA["Records"]
+        TAB["tables.py<br/>load_tables"]
+        REC["records.py<br/>select_admissions, build_records, lexicon"]
+    end
+    subgraph GEN["Generation"]
+        GNS["generators.py<br/>Template, LLM, injectors"]
+        PRM["prompts.py<br/>generator and judge prompts, RUBRIC"]
+        SUM["summary.py<br/>Summary, parse_summary"]
+        LLM["llm.py<br/>chat model adapters, check_privacy"]
+    end
+    subgraph EVAL["Evaluation"]
+        FTH["faithfulness.py<br/>FaithfulnessChecker"]
+        JDG["judge.py<br/>LLMJudge, RuleJudge, ensure_independent"]
+        MET["metrics.py<br/>ROUGE, Spearman, Kendall, bootstrap_ci"]
+        PIPE["pipeline.py<br/>run_benchmark, summarize, agreement"]
+    end
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> TAB
+    CLI --> REC
+    CLI --> GNS
+    CLI --> JDG
+    CLI --> LLM
+    CLI --> PIPE
+    REC --> TAB
+    GNS --> LLM
+    GNS --> PRM
+    GNS --> SUM
+    JDG --> LLM
+    JDG --> PRM
+    JDG --> FTH
+    PIPE --> GNS
+    PIPE --> FTH
+    PIPE --> JDG
+    PIPE --> MET
+    FTH --> REC
+    FTH --> SUM
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -189,6 +237,22 @@ The admission sample uses a seed. Generation uses temperature 0 and a fixed seed
 ### 3.7 De-identified prompts and local endpoints
 A record has a salted pseudonymous id, an age group and a length of stay. It has no subject id, no admission id and no dates. `llm.check_privacy` refuses to send a record that is not synthetic to a remote endpoint unless `EHR2SUMMARY_ALLOW_REMOTE_RECORDS=true`.
 
+```mermaid
+flowchart TD
+    ADM[/"Admission: hadm_id, subject_id,<br/>dates, codes"/] --> PS["pseudonym: r- and 12 hex characters<br/>of SHA-256 of salt and hadm_id"]
+    ADM --> AG["age_group and length_of_stay_days"]
+    PS --> REC["Record"]
+    AG --> REC
+    REC --> PV["prompt_view: no reference note,<br/>no synthetic flag, no unknown codes"]
+    PV --> CP{"check_privacy:<br/>record synthetic?"}
+    CP -- "yes" --> SEND["Send to the chat model"]
+    CP -- "no" --> LOC{"Endpoint local, or a<br/>Hugging Face model?"}
+    LOC -- "yes" --> SEND
+    LOC -- "no" --> AL{"EHR2SUMMARY_ALLOW_REMOTE_RECORDS<br/>= true?"}
+    AL -- "yes" --> SEND
+    AL -- "no" --> ERR[/"PrivacyError: the run stops"/]
+```
+
 ---
 
 ## 4. The end-to-end workflow
@@ -196,29 +260,65 @@ A record has a salted pseudonymous id, an age group and a length of stay. It has
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    T["tables"] --> CHK["column check"] --> SEL["seeded sample of admissions"] --> REC["record builder"]
-    DICT["dictionaries"] --> REC
-    REC --> G1["template generator"]
-    REC --> G2["chat model generator"]
-    G1 --> INJ["error injectors"]
-    G1 --> S["summaries"]
+flowchart TD
+    T[/"MIMIC-III style CSV tables"/] --> CHK["load_tables: column check,<br/>ICD-9 codes as text"]
+    CHK --> SEL["select_admissions: seeded sample<br/>with at least one diagnosis"]
+    SEL --> REC["build_records: items with reference ids"]
+    DICT[("D_ICD_DIAGNOSES, D_ICD_PROCEDURES")] --> REC
+    REC --> RJ[("runs/records.jsonl<br/>optional")]
+    REC --> G1["TemplateGenerator"]
+    REC --> G2["LLMGenerator: check_privacy,<br/>temperature 0, JSON"]
+    G1 --> INJ["HallucinationInjector,<br/>OmissionInjector"]
+    G1 --> S["Summaries"]
     G2 --> S
     INJ --> S
-    S --> F["faithfulness check"]
-    LEX["lexicon of all titles and drugs"] --> F
-    S --> J["judge: record + summary"]
-    REC --> J
-    S --> RG["ROUGE vs reference note"]
-    F --> AGG["aggregate with bootstrap intervals"]
+    S --> ID{"Summary record id<br/>= record id?"}
+    ID -- "no" --> STOP[/"RuntimeError: the run stops"/]
+    ID -- "yes" --> F["FaithfulnessChecker.check"]
+    LEX[("Lexicon: all titles and drugs")] --> F
+    ID -- "yes" --> J["Judge: record and summary"]
+    ID -- "yes" --> RG["ROUGE against the reference note"]
+    F --> AGG["summarize: means with bootstrap intervals"]
     J --> AGG
     RG --> AGG
-    AGG --> REP["report.json"]
-    HR["human ratings"] --> AGR["Spearman and Kendall tau-b"]
-    J --> AGR
+    AGG --> OUT[("runs: rows.jsonl, report.json,<br/>failures.json")]
+    OUT --> HUMAN{{"CLINICIAN<br/>review each summary,<br/>write ratings.csv"}}
+    HUMAN --> AGR["agreement: Spearman and Kendall tau-b"]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one admission
+
+```mermaid
+stateDiagram-v2
+    state "Admission in the tables" as Adm
+    state "Not selected" as Out
+    state "De-identified record" as Rec
+    state "Summary" as Sum
+    state "Failure in failures.json" as Fail
+    state "Checked summary" as Checked
+    state "Scored summary" as Scored
+    state "Row in rows.jsonl" as Row
+    state "In report.json" as Rep
+    [*] --> Adm
+    Adm --> Out: no diagnosis, or not in the seeded sample
+    Adm --> Rec: build_record
+    Rec --> Sum: generator.generate
+    Rec --> Fail: LLMError after all attempts
+    Rec --> PrivacyError: real record, remote endpoint
+    Sum --> RecordMismatch: summary record id differs
+    Sum --> Checked: FaithfulnessChecker.check
+    Checked --> Scored: judge.score, ROUGE if a reference note
+    Scored --> Row: write_outputs
+    Row --> Rep: summarize
+    Out --> [*]
+    Fail --> [*]
+    Rep --> [*]
+    PrivacyError --> [*]
+    RecordMismatch --> [*]
+```
 
 1. The selector picks the admission with the seed `EHR2SUMMARY_SEED`.
 2. The record builder writes the record with the id `r-…`, the items and the reference note, if there is one.
@@ -229,11 +329,91 @@ flowchart TB
 7. If the record has a reference note, the runner calculates ROUGE.
 8. The runner writes one row to `rows.jsonl`. After all rows, it writes `report.json`.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Researcher
+    participant CLI as ehr2summary CLI
+    participant TAB as tables.py and records.py
+    participant GEN as Generator
+    participant GM as Generator chat model
+    participant FC as FaithfulnessChecker
+    participant JDG as Judge
+    participant JM as Judge chat model
+    participant FS as runs folder
+
+    R->>CLI: ehr2summary run --systems template,llm --judge llm
+    CLI->>CLI: Settings.from_env
+    CLI->>TAB: load_tables, select_admissions, build_records
+    TAB-->>CLI: records and lexicon
+    CLI->>CLI: ensure_independent(generator, judge)
+    loop each system and each record
+        CLI->>GEN: generate(record)
+        GEN->>GEN: check_privacy
+        GEN->>GM: generator prompt and record JSON, temperature 0
+        GM-->>GEN: JSON reply
+        GEN->>GEN: parse_summary, retry once with the error
+        GEN-->>CLI: Summary, or LLMError as a failure
+        CLI->>FC: check(record, summary)
+        FC-->>CLI: FaithfulnessReport
+        CLI->>JDG: score(record, summary)
+        JDG->>JM: judge prompt with the record and the summary
+        JM-->>JDG: four scores and reasons
+        JDG-->>CLI: JudgeResult
+    end
+    CLI->>CLI: summarize, bootstrap intervals
+    CLI->>FS: rows.jsonl, report.json, failures.json
+    CLI-->>R: report JSON
+    R->>CLI: ehr2summary agreement --rows --ratings
+    CLI-->>R: Spearman and Kendall tau-b for each criterion
+```
+
 ---
 
 ## 5. The record builder
 
 **Purpose.** Make one structured, de-identified record for each admission. The record is the only input of the generator and of the judge.
+
+```mermaid
+flowchart TD
+    DIR[/"Data folder"/] --> FIND{"Each required table:<br/>NAME.csv, name.csv or .csv.gz found?"}
+    FIND -- "no" --> E1[/"TableError: table not found"/]
+    FIND -- "yes" --> READ["read_csv: lower-case columns,<br/>text dtype for codes and titles"]
+    READ --> COLS{"Required columns present?"}
+    COLS -- "no" --> E2[/"TableError: table lacks columns"/]
+    COLS -- "yes" --> OPT["Optional tables if present:<br/>PRESCRIPTIONS, LABEVENTS,<br/>D_LABITEMS, NOTEEVENTS"]
+    OPT --> TABLES[/"Tables"/]
+    TABLES --> SEL["select_admissions: admissions with a diagnosis,<br/>sorted, seeded sample of n"]
+    SEL --> MARK{"SYNTHETIC marker file<br/>in the folder?"}
+    MARK -- "yes" --> SYN["synthetic = true"]
+    MARK -- "no" --> REAL["synthetic = false"]
+    SYN --> BUILD["build_record for each hadm_id"]
+    REAL --> BUILD
+```
+
+`build_record` makes one record:
+
+```mermaid
+flowchart LR
+    A[/"One hadm_id"/] --> CTX["Admission type, discharge location,<br/>sex, age group, length of stay, died"]
+    A --> DX["_coded: diagnoses in seq_num order,<br/>no duplicates, dx1, dx2"]
+    A --> PX["_coded: procedures, px1, px2"]
+    A --> MED["_medications: each drug once,<br/>all routes, med1, med2"]
+    A --> LAB["_labs: last abnormal or delta value<br/>of each item, lab1, lab2"]
+    A --> NOTE["First discharge summary note,<br/>if NOTEEVENTS exists"]
+    DX --> UNK{"Code in the dictionary?"}
+    UNK -- "no" --> UC["Keep the code with no description,<br/>add it to unknown_codes"]
+    UNK -- "yes" --> LIM["Cut each list at MAX_ITEMS,<br/>labs at MAX_LABS, count the cut"]
+    PX --> UNK
+    UC --> LIM
+    MED --> LIM
+    LAB --> LIM
+    CTX --> OUT[/"Record with record_id r-..."/]
+    LIM --> OUT
+    NOTE --> OUT
+```
 
 | Input | Output |
 |---|---|
@@ -269,6 +449,24 @@ flowchart TB
 
 **Purpose.** Write one summary for each record. Each system is one generator.
 
+```mermaid
+flowchart TD
+    SYS[/"--systems list"/] --> T["template: TemplateGenerator"]
+    SYS --> H["hallucination: HallucinationInjector"]
+    SYS --> O["omission: OmissionInjector"]
+    SYS --> L["llm: LLMGenerator"]
+    T --> TS["One statement for each item, with its reference id.<br/>Empty section: Not documented in the record."]
+    H --> HB["Template summary"]
+    HB --> HA["Add 2 seeded lexicon diagnoses or drugs<br/>that are not in the record"]
+    O --> OB["Template summary"]
+    OB --> OA["Keep the first statement of each section"]
+    L --> LS["Chat model summary"]
+    TS --> OUT[/"Summary: 5 sections of statements,<br/>record_id from the record"/]
+    HA --> OUT
+    OA --> OUT
+    LS --> OUT
+```
+
 | System | What it does |
 |---|---|
 | `template` | Offline baseline. One statement for each item, with its reference id |
@@ -284,6 +482,21 @@ flowchart TB
 4. If the reply is not valid, send the error and try again. The default is 2 attempts.
 5. If all attempts fail, the runner records a failure for this record and continues.
 
+```mermaid
+flowchart TD
+    REC[/"Record"/] --> PRIV["check_privacy"]
+    PRIV -- "refused" --> PE[/"PrivacyError: the run stops"/]
+    PRIV -- "allowed" --> MSG["generator_messages:<br/>system rules and record JSON"]
+    MSG --> CALL["complete: temperature 0,<br/>fixed seed, JSON mode"]
+    CALL --> PARSE["parse_summary: first JSON object,<br/>sections object"]
+    PARSE --> V{"Valid? Known section names,<br/>statements with text"}
+    V -- "yes" --> OK[/"Summary with the record id of the record"/]
+    V -- "no" --> MORE{"Attempt left?<br/>default 2 attempts"}
+    MORE -- "yes" --> RETRY["Add the reply and the error<br/>to the messages"]
+    RETRY --> CALL
+    MORE -- "no" --> FAIL[/"LLMError: failures.json,<br/>the run continues"/]
+```
+
 **Rules**
 
 - The Hugging Face adapter uses the chat template of the model and returns only the new text (`return_full_text=False`).
@@ -294,6 +507,27 @@ flowchart TB
 ## 7. The faithfulness check and the judges
 
 **Purpose.** Find unsupported facts with rules, then score each summary with a judge that sees the record.
+
+```mermaid
+flowchart TD
+    LEX[/"Lexicon: diagnosis titles,<br/>procedure titles, drug names"/] --> TERMS["Normalise terms, keep 4 or more characters,<br/>sort longest first"]
+    IN[/"Record and summary"/] --> SAME{"Same record id?"}
+    SAME -- "no" --> ERR[/"ValueError"/]
+    SAME -- "yes" --> ST["For each statement"]
+    ST --> REF{"Each reference id<br/>in the record?"}
+    REF -- "no" --> IR["invalid_refs"]
+    ST --> FIND["find_terms: match, then mask the match"]
+    TERMS --> FIND
+    FIND --> SUP{"Term is a record item?<br/>labs excluded"}
+    SUP -- "yes" --> SP["supported, item covered"]
+    SUP -- "no" --> UT["unsupported_terms"]
+    ST --> CODE{"ICD-9 code in the text<br/>that is not in the record?"}
+    CODE -- "yes" --> UC["unknown_codes"]
+    SP --> REP[/"FaithfulnessReport: precision = supported / mentions,<br/>recall = covered / record items,<br/>hallucinated if any error list is not empty"/]
+    UT --> REP
+    IR --> REP
+    UC --> REP
+```
 
 | Input | Output |
 |---|---|
@@ -316,6 +550,27 @@ flowchart TB
 3. Repeat for `EHR2SUMMARY_JUDGE_SAMPLES` samples with the seeds `seed`, `seed+1`, and so on. Return the mean and the spread.
 4. In `logprob` mode, ask for one criterion at a time and one integer. Weight each score token 0 to 10 by its probability (G-Eval).
 
+```mermaid
+flowchart TD
+    J{"--judge"} -- "none" --> NO[/"No judge scores"/]
+    J -- "rule" --> RJ["RuleJudge: faithfulness check<br/>and text statistics"]
+    J -- "llm or llm-logprob" --> BM["build_chat_model(judge settings)"]
+    BM --> IND{"An llm system with the<br/>same model identity?"}
+    IND -- "yes, no override" --> JE[/"JudgeIndependenceError"/]
+    IND -- "no" --> PRIV["check_privacy for each record"]
+    PRIV --> MODE{"Mode"}
+    MODE -- "json" --> JM["judge_messages: rubric, record, summary"]
+    JM --> PS["parse_scores: 4 criteria, 0 to 10,<br/>retry once if not valid"]
+    PS --> SMP["Repeat for JUDGE_SAMPLES<br/>with seed, seed+1"]
+    SMP --> MEAN["Mean and spread of each criterion"]
+    MODE -- "logprob" --> ONE["single_criterion_messages:<br/>one criterion, one integer"]
+    ONE --> TOP["top_logprobs of the first token"]
+    TOP --> WT["Score = sum of k × p for k 0 to 10"]
+    RJ --> OUT[/"JudgeResult"/]
+    MEAN --> OUT
+    WT --> OUT
+```
+
 **Rules**
 
 - The rule judge is an offline baseline. It is not a validated clinical judge.
@@ -337,9 +592,44 @@ flowchart TB
 | `clinical_accuracy` | 10 × entity precision − 2 × invalid reference ids − 2 × unknown codes |
 | `completeness` | 10 × entity recall |
 | `readability` | 10 − 0.4 × (mean statement words − 25 if above 25) − 1.0 × (5 − mean words if below 5) |
-| `actionability` | 4 for a discharge location (or death) + 3 for cited medications + 3 for cited abnormal labs |
+| `actionability` | 4 for a discharge location (or death) + 3 for cited medications (or no medications in the record) + 3 for cited labs in the follow-up section (or no labs in the record) |
 
 All rule judge scores are clipped to 0 to 10.
+
+```mermaid
+flowchart LR
+    IN[/"Record and summary"/] --> FC["FaithfulnessChecker.check"]
+    FC --> ACC["clinical_accuracy = 10 × precision<br/>− 2 × invalid refs − 2 × unknown codes"]
+    FC --> COM["completeness = 10 × recall"]
+    IN --> WD["Mean words of the statements,<br/>Not documented excluded"]
+    WD --> RD["readability = 10 − 0.4 × words above 25<br/>− 1.0 × words below 5"]
+    IN --> FU["follow_up and medications sections"]
+    FU --> ACT["actionability = 4 + 3 + 3<br/>for location, medicines, labs"]
+    ACC --> CL["Clip to 0 to 10"]
+    COM --> CL
+    RD --> CL
+    ACT --> CL
+    CL --> OUT[/"JudgeResult of rule-judge"/]
+```
+
+The runner aggregates the rows of each system:
+
+```mermaid
+flowchart TD
+    ROWS[/"Rows of one system"/] --> EP["entity_precision, entity_recall,<br/>hallucination_rate"]
+    ROWS --> RG{"Rows with ROUGE?"}
+    RG -- "yes" --> RL["rougeL"]
+    ROWS --> JS{"Rows with judge scores?"}
+    JS -- "yes" --> JC["judge: each criterion"]
+    EP --> CI["bootstrap_ci: mean and 95 % interval,<br/>2000 resamples, seed"]
+    RL --> CI
+    JC --> CI
+    CI --> REP[/"report.json: systems, failures,<br/>records, synthetic, judge, seed"/]
+    RAT[/"ratings.csv: record_id, system,<br/>criterion, rating 0 to 10"/] --> AV["read_ratings: mean of the raters"]
+    AV --> AG{"3 or more pairs<br/>for the criterion?"}
+    AG -- "yes" --> CORR[/"Spearman and Kendall tau-b"/]
+    AG -- "no" --> NV[/"null values"/]
+```
 
 | Report value | Meaning |
 |---|---|
@@ -396,6 +686,18 @@ pip install -e ".[dev]"         # extras: hf, bertscore, all
 ```
 
 ### 10.3 Run ehr2summary
+
+```mermaid
+flowchart LR
+    subgraph DEMO["ehr2summary demo"]
+        W["write_synthetic: 40 admissions,<br/>SYNTHETIC marker"] --> RUN1["run: template, hallucination,<br/>omission, rule judge"]
+    end
+    REC["ehr2summary records"] --> RJ[/"runs/records.jsonl"/]
+    RJ --> RUN2["ehr2summary run --records"]
+    RUN2 --> OUT[/"rows.jsonl, report.json"/]
+    RUN1 --> OUT
+    OUT --> AGR["ehr2summary agreement<br/>--rows --ratings"]
+```
 
 ```bash
 # 1. Offline demo: synthetic tables, three systems, rule judge
